@@ -7,7 +7,7 @@ use RuntimeException;
 class ActiveDirectoryPasswordBroker
 {
     /**
-     * @return array{dn: string, display_name: string, email: ?string, phone: ?string}
+     * @return array{dn: string, display_name: string, email: ?string, phone: ?string, username?: ?string, title?: ?string, department?: ?string}
      */
     public function findUserByEmailOrPhone(string $identifier): array
     {
@@ -27,7 +27,7 @@ class ActiveDirectoryPasswordBroker
             $connection,
             (string) config('sspr.ldap.base_dn'),
             $filter,
-            ['distinguishedName', 'displayName', 'cn', 'mail', 'mobile', 'telephoneNumber'],
+            $this->profileAttributes(),
             0,
             2,
             (int) config('sspr.ldap.timeout', 5),
@@ -43,14 +43,119 @@ class ActiveDirectoryPasswordBroker
             throw new RuntimeException('No matching Active Directory user was found.');
         }
 
-        $entry = $entries[0];
+        return $this->mapEntry($entries[0]);
+    }
 
-        return [
-            'dn' => (string) ($entry['distinguishedname'][0] ?? ''),
-            'display_name' => (string) ($entry['displayname'][0] ?? $entry['cn'][0] ?? 'User'),
-            'email' => $entry['mail'][0] ?? null,
-            'phone' => $entry['mobile'][0] ?? $entry['telephonenumber'][0] ?? null,
-        ];
+    /**
+     * @return array{dn: string, display_name: string, email: ?string, phone: ?string, username: ?string, title: ?string, department: ?string}
+     */
+    public function authenticate(string $username, string $password): array
+    {
+        $serviceConnection = $this->bind(
+            (string) config('sspr.ldap.username'),
+            (string) config('sspr.ldap.password'),
+        );
+
+        $escaped = ldap_escape($username, '', LDAP_ESCAPE_FILTER);
+        $filter = '(&'.
+            '(objectClass=user)'.
+            '(!(userAccountControl:1.2.840.113556.1.4.803:=2))'.
+            '(|(sAMAccountName='.$escaped.')(userPrincipalName='.$escaped.')(mail='.$escaped.'))'.
+        ')';
+
+        $search = @ldap_search(
+            $serviceConnection,
+            (string) config('sspr.ldap.base_dn'),
+            $filter,
+            $this->profileAttributes(),
+            0,
+            2,
+            (int) config('sspr.ldap.timeout', 5),
+        );
+
+        if ($search === false) {
+            throw new RuntimeException('Unable to search Active Directory: '.ldap_error($serviceConnection));
+        }
+
+        $entries = ldap_get_entries($serviceConnection, $search);
+
+        if (($entries['count'] ?? 0) < 1) {
+            throw new RuntimeException('Invalid credentials.');
+        }
+
+        $profile = $this->mapEntry($entries[0]);
+
+        $this->bind($profile['dn'], $password);
+
+        return $profile;
+    }
+
+    /**
+     * @return array{dn: string, display_name: string, email: ?string, phone: ?string, username: ?string, title: ?string, department: ?string}
+     */
+    public function profile(string $distinguishedName): array
+    {
+        $connection = $this->bind(
+            (string) config('sspr.ldap.username'),
+            (string) config('sspr.ldap.password'),
+        );
+
+        $search = @ldap_read(
+            $connection,
+            $distinguishedName,
+            '(objectClass=user)',
+            $this->profileAttributes(),
+            0,
+            1,
+            (int) config('sspr.ldap.timeout', 5),
+        );
+
+        if ($search === false) {
+            throw new RuntimeException('Unable to read Active Directory profile: '.ldap_error($connection));
+        }
+
+        $entries = ldap_get_entries($connection, $search);
+
+        if (($entries['count'] ?? 0) < 1) {
+            throw new RuntimeException('Active Directory profile was not found.');
+        }
+
+        return $this->mapEntry($entries[0]);
+    }
+
+    /**
+     * @param  array{email: string|null, phone: string|null}  $attributes
+     */
+    public function updateContactInfo(string $distinguishedName, array $attributes): void
+    {
+        $connection = $this->bind(
+            (string) config('sspr.ldap.reset_username', config('sspr.ldap.username')),
+            (string) config('sspr.ldap.reset_password', config('sspr.ldap.password')),
+        );
+
+        $changes = [];
+
+        if (($attributes['email'] ?? null) !== null) {
+            $changes['mail'] = [$attributes['email']];
+        } elseif (array_key_exists('email', $attributes)) {
+            @ldap_mod_del($connection, $distinguishedName, ['mail' => []]);
+        }
+
+        if (($attributes['phone'] ?? null) !== null) {
+            $changes['mobile'] = [$attributes['phone']];
+            $changes['telephoneNumber'] = [$attributes['phone']];
+        } elseif (array_key_exists('phone', $attributes)) {
+            @ldap_mod_del($connection, $distinguishedName, ['mobile' => []]);
+            @ldap_mod_del($connection, $distinguishedName, ['telephoneNumber' => []]);
+        }
+
+        if ($changes === []) {
+            return;
+        }
+
+        if (@ldap_mod_replace($connection, $distinguishedName, $changes) !== true) {
+            throw new RuntimeException('Active Directory rejected the profile update: '.ldap_error($connection));
+        }
     }
 
     public function resetPassword(string $distinguishedName, string $newPassword): void
@@ -108,5 +213,41 @@ class ActiveDirectoryPasswordBroker
     protected function encodeActiveDirectoryPassword(string $password): string
     {
         return mb_convert_encoding('"'.$password.'"', 'UTF-16LE', 'UTF-8');
+    }
+
+    /**
+     * @return list<string>
+     */
+    protected function profileAttributes(): array
+    {
+        return [
+            'distinguishedName',
+            'displayName',
+            'cn',
+            'sAMAccountName',
+            'userPrincipalName',
+            'mail',
+            'mobile',
+            'telephoneNumber',
+            'title',
+            'department',
+        ];
+    }
+
+    /**
+     * @param  array<string, mixed>  $entry
+     * @return array{dn: string, display_name: string, email: ?string, phone: ?string, username: ?string, title: ?string, department: ?string}
+     */
+    protected function mapEntry(array $entry): array
+    {
+        return [
+            'dn' => (string) ($entry['distinguishedname'][0] ?? ''),
+            'display_name' => (string) ($entry['displayname'][0] ?? $entry['cn'][0] ?? 'User'),
+            'email' => $entry['mail'][0] ?? null,
+            'phone' => $entry['mobile'][0] ?? $entry['telephonenumber'][0] ?? null,
+            'username' => $entry['samaccountname'][0] ?? $entry['userprincipalname'][0] ?? null,
+            'title' => $entry['title'][0] ?? null,
+            'department' => $entry['department'][0] ?? null,
+        ];
     }
 }

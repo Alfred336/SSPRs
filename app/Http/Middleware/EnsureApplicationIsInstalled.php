@@ -10,6 +10,10 @@ class EnsureApplicationIsInstalled
 {
     public function handle(Request $request, Closure $next): Response
     {
+        if ($this->isInstalled() && $request->is('setup', 'setup/*')) {
+            return redirect()->route('home');
+        }
+
         if ($this->isInstalled() || $request->is('setup', 'setup/*', 'livewire*')) {
             return $next($request);
         }
